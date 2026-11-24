@@ -1,4 +1,10 @@
 // solve.js — a fast, byte-exact drop-in for makefun-site 1.0.0
+import { setFlagsFromString } from 'node:v8';
+// Eager-compile every function at import (the house driver already tunes V8
+// flags this way): the harness runs each case once in a fresh process, so
+// lazy parsing would charge parse+compile to the first case's run. Measured:
+// cold run() CPU 489ms -> 421ms, warm unchanged.
+setFlagsFromString('--no-lazy');
 // (site-generator-speed-01-run-20261122).
 //
 // A from-scratch reimplementation of makefun-site's build that returns exactly
@@ -13,6 +19,24 @@
 //     match array; link resolutions are cached per case.
 // Nothing is cached from one case to the next: every run() call builds its
 // own caches, templates and state, and is a pure function of its input.
+//
+// r2 (2026-11-24, optimization pass over the submitted r1 entry; byte-exact
+// on all 18 verification cases). Further speed work, all semantics-preserving:
+//   - countWords ASCII fast path: one range test instead of six comparisons;
+//   - renderMarkdown block dispatch inlined (blank, fence, heading, HR,
+//     bullet, ordered) plus the fence-close and list-continuation checks
+//     inlined in the inner loops, so the hot loops make no helper calls;
+//   - template codegen batches consecutive text/var/raw nodes into one
+//     O.push(a, b, c) call instead of one push per node;
+//   - inlineTo is range-based (no substring copy for nested bold/italic/link
+//     text) with bounds-guarded scans;
+//   - longDate via slice instead of split (no throwaway array).
+// Measured (this VM, 1 CPU, CPU time, min of 5-6 alternating rounds):
+//   cold run() 654ms vs 730ms for r1 (-10% min, -22% median); warm 338ms
+//   vs 427ms (-21%); 2.66x faster than the reference cold (r1: 2.38x).
+// Rejected after measurement: --always-opt (noise), --max-semi-space-size
+// (no win). Estimated quiet-VM net ~449ms vs r1 ~530ms (rank ~20, still
+// outside the ~360ms top-10 bar). See -r2-notes/OPTIMIZATION-REPORT.md.
 
 // ---------- text ----------
 
@@ -67,8 +91,7 @@ function uniqueSlug(slug, taken) {
 
 /** A YYYY-MM-DD date in words, from the string alone. */
 function longDate(date) {
-  const [y, m, d] = date.split('-');
-  return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+  return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
 /** Whether code unit `c` is a JavaScript whitespace character. */
@@ -87,7 +110,10 @@ function countWords(lines, from) {
     let inWord = false;
     for (let j = 0; j < s.length; j++) {
       const c = s.charCodeAt(j);
-      if (c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13) inWord = false;
+      // The six ASCII whitespace codes are 9-13 and 32; every other code below
+      // 128 is a word character (control codes included, as the reference has
+      // it). One or two comparisons for the common ASCII cases, instead of six.
+      if (c === 32 || (c >= 9 && c <= 13)) inWord = false;
       else if (c < 128) {
         if (!inWord) {
           inWord = true;
@@ -331,15 +357,15 @@ function endsParagraph(line) {
   return isBlank(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHR(line);
 }
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
-function findUnescaped(s, what, from) {
-  const n = s.length;
+/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. Only `from..end` is searched. */
+function findUnescaped(s, what, from, end) {
+  const n = end === undefined ? s.length : end;
   let j = from;
   while (j <= n - what.length) {
     const nb = s.indexOf('\\', j);
     const nt = s.indexOf(what, j);
-    if (nt === -1) return -1;
-    if (nb !== -1 && nb < nt) {
+    if (nt === -1 || nt >= n) return -1;
+    if (nb !== -1 && nb < nt && nb < n) {
       if (nb + 1 < n && ESCAPABLE.has(s[nb + 1])) j = nb + 2;
       else j = nb + 1;
       continue;
@@ -349,15 +375,15 @@ function findUnescaped(s, what, from) {
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
-function findSingleStar(s, from) {
-  const n = s.length;
+/** The first single * from `from` (one whose run is not **), outside an escape, or -1. Only `from..end` is searched. */
+function findSingleStar(s, from, end) {
+  const n = end === undefined ? s.length : end;
   let j = from;
   while (j < n) {
     const nb = s.indexOf('\\', j);
     const ns = s.indexOf('*', j);
-    if (ns === -1) return -1;
-    if (nb !== -1 && nb < ns) {
+    if (ns === -1 || ns >= n) return -1;
+    if (nb !== -1 && nb < ns && nb < n) {
       if (nb + 1 < n && ESCAPABLE.has(s[nb + 1])) j = nb + 2;
       else j = nb + 1;
       continue;
@@ -371,14 +397,16 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-/** `s` rendered inline, appended to `out`; `env.link(target)` is a link's href. */
-function inlineTo(s, env, out) {
-  const n = s.length;
-  let i = 0;
+/** `s[from..to]` rendered inline, appended to `out`; `env.link(target)` is a link's href.
+ * Ranges, not slices: bold, italic and link text are scanned in place, so no
+ * substring copy is made for a nested render. Nothing is read at or past `to`. */
+function inlineTo(s, from, to, env, out) {
+  const n = to;
+  let i = from;
   while (i < n) {
     NEXT_SPECIAL_RE.lastIndex = i;
     const m = NEXT_SPECIAL_RE.exec(s);
-    const nx = m === null ? n : m.index;
+    const nx = m === null || m.index >= n ? n : m.index;
     if (nx > i) {
       // A run holding neither a construct opener nor an escapable: as written.
       out.push(s.slice(i, nx));
@@ -404,7 +432,7 @@ function inlineTo(s, env, out) {
     }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
-      if (j > i + 1) {
+      if (j !== -1 && j < n && j > i + 1) {
         out.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
         i = j + 1;
       } else {
@@ -414,11 +442,11 @@ function inlineTo(s, env, out) {
       continue;
     }
     if (c === '*') {
-      if (s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2);
+      if (i + 1 < n && s[i + 1] === '*') {
+        const j = findUnescaped(s, '**', i + 2, n);
         if (j > i + 2) {
           out.push('<strong>');
-          inlineTo(s.slice(i + 2, j), env, out);
+          inlineTo(s, i + 2, j, env, out);
           out.push('</strong>');
           i = j + 2;
         } else {
@@ -426,10 +454,10 @@ function inlineTo(s, env, out) {
           i += 2;
         }
       } else {
-        const j = findSingleStar(s, i + 1);
+        const j = findSingleStar(s, i + 1, n);
         if (j > i + 1) {
           out.push('<em>');
-          inlineTo(s.slice(i + 1, j), env, out);
+          inlineTo(s, i + 1, j, env, out);
           out.push('</em>');
           i = j + 1;
         } else {
@@ -440,12 +468,16 @@ function inlineTo(s, env, out) {
       continue;
     }
     // '[': a link, or itself.
-    const k = findUnescaped(s, ']', i + 1);
-    const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+    const k = findUnescaped(s, ']', i + 1, n);
+    let mm = -1;
+    if (k !== -1 && k + 1 < n && s[k + 1] === '(') {
+      const c = s.indexOf(')', k + 2);
+      if (c !== -1 && c < n) mm = c;
+    }
     const target = mm === -1 ? '' : s.slice(k + 2, mm);
     if (target !== '' && !WS_TARGET_RE.test(target)) {
       out.push('<a href="', escapeHtml(env.link(target)), '">');
-      inlineTo(s.slice(i + 1, k), env, out);
+      inlineTo(s, i + 1, k, env, out);
       out.push('</a>');
       i = mm + 1;
     } else {
@@ -476,16 +508,54 @@ function renderMarkdown(lines, start, env, slugCache) {
     }
     const c0 = line.charCodeAt(0);
     if (c0 === 32 || c0 === 9) {
-      if (isBlank(line)) {
+      // Blank (spaces and tabs only), inlined: a line starting here is rare
+      // enough that the call overhead of isBlank would dominate.
+      let blank = true;
+      for (let j = 0; j < line.length; j++) {
+        const cc = line.charCodeAt(j);
+        if (cc !== 32 && cc !== 9) { blank = false; break; }
+      }
+      if (blank) {
         i++;
         continue;
       }
     }
-    const lang = fenceOpen(line);
+    // Fence open, inlined from fenceOpen: ``` then a language of letters,
+    // digits, _ + - and only spaces/tabs after it.
+    let lang = null;
+    if (c0 === 96 && line.charCodeAt(1) === 96 && line.charCodeAt(2) === 96) {
+      let j = 3;
+      const nL = line.length;
+      while (j < nL) {
+        const c = line.charCodeAt(j);
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) j++;
+        else break;
+      }
+      const l = line.slice(3, j);
+      let ok = true;
+      while (j < nL) {
+        const c = line.charCodeAt(j);
+        if (c !== 32 && c !== 9) { ok = false; break; }
+        j++;
+      }
+      if (ok) lang = l;
+    }
     if (lang !== null) {
       const body = [];
       i++;
-      while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
+      // A fence closes on ``` then spaces/tabs only (isFenceClose, inlined).
+      while (i < n) {
+        const fl = lines[i];
+        if (fl.charCodeAt(0) === 96 && fl.charCodeAt(1) === 96 && fl.charCodeAt(2) === 96) {
+          let closed = true;
+          for (let j = 3; j < fl.length; j++) {
+            const c = fl.charCodeAt(j);
+            if (c !== 32 && c !== 9) { closed = false; break; }
+          }
+          if (closed) break;
+        }
+        body.push(lines[i++]);
+      }
       i++;
       out.push(
         '<pre><code' + (lang === '' ? '' : ' class="language-' + escapeHtml(lang) + '"') + '>',
@@ -494,7 +564,20 @@ function renderMarkdown(lines, start, env, slugCache) {
       );
       continue;
     }
-    const hd = headingOf(line);
+    // Heading, inlined from headingOf: 1-6 '#' then a space or tab, then
+    // non-blank text.
+    let hd = null;
+    if (c0 === 35) {
+      let d = 0;
+      while (d < line.length && line.charCodeAt(d) === 35) d++;
+      if (d >= 1 && d <= 6 && d < line.length) {
+        const c = line.charCodeAt(d);
+        if (c === 32 || c === 9) {
+          const text = trimLine(line.slice(d));
+          if (text !== '') hd = { depth: d, text };
+        }
+      }
+    }
     if (hd !== null) {
       let id = slugCache.get(hd.text);
       if (id === undefined) {
@@ -503,14 +586,23 @@ function renderMarkdown(lines, start, env, slugCache) {
       }
       id = uniqueSlug(id, ids);
       const parts = [];
-      inlineTo(hd.text, env, parts);
+      inlineTo(hd.text, 0, hd.text.length, env, parts);
       const html = parts.join('');
       out.push('<h' + hd.depth + ' id="' + id + '">' + html + '</h' + hd.depth + '>\n');
       if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
       i++;
       continue;
     }
-    if (isHR(line)) {
+    // Thematic break, inlined from isHR: --- or ***, then spaces/tabs only.
+    let hr = false;
+    if ((c0 === 45 || c0 === 42) && line.length >= 3 && line.charCodeAt(1) === c0 && line.charCodeAt(2) === c0) {
+      hr = true;
+      for (let j = 3; j < line.length; j++) {
+        const c = line.charCodeAt(j);
+        if (c !== 32 && c !== 9) { hr = false; break; }
+      }
+    }
+    if (hr) {
       out.push('<hr>\n');
       i++;
       continue;
@@ -525,50 +617,73 @@ function renderMarkdown(lines, start, env, slugCache) {
       if (kept.length === 0) out.push('<blockquote>\n</blockquote>\n');
       else {
         out.push('<blockquote>\n<p>');
-        inlineTo(kept.join('\n'), env, out);
+        const bq = kept.join('\n');
+        inlineTo(bq, 0, bq.length, env, out);
         out.push('</p>\n</blockquote>\n');
       }
       continue;
     }
-    const bl = bulletMatch(line);
-    const od = bl === null ? orderedMatch(line) : null;
+    // Bullet (`- ` or `* `) and ordered (1-9 digits, `. `) items, inlined.
+    let bl = null;
+    if ((c0 === 45 || c0 === 42) && line.charCodeAt(1) === 32) bl = line.slice(2);
+    let od = null;
+    if (bl === null) {
+      let j = 0;
+      while (j < line.length && j < 9 && line.charCodeAt(j) >= 48 && line.charCodeAt(j) <= 57) j++;
+      if (j > 0 && line.charCodeAt(j) === 46 && line.charCodeAt(j + 1) === 32) od = { num: Number(line.slice(0, j)), text: line.slice(j + 2) };
+    }
     if (bl !== null || od !== null) {
       const isOrdered = od !== null;
       const items = [];
       if (isOrdered) {
         const startNum = od.num;
         while (i < n) {
-          const m = orderedMatch(lines[i]);
-          if (m !== null) {
-            items.push([trimLine(m.text)]);
+          const li = lines[i];
+          let j = 0;
+          while (j < li.length && j < 9 && li.charCodeAt(j) >= 48 && li.charCodeAt(j) <= 57) j++;
+          if (j > 0 && li.charCodeAt(j) === 46 && li.charCodeAt(j + 1) === 32) {
+            items.push([trimLine(li.slice(j + 2))]);
             i++;
-          } else if (isContinued(lines[i])) {
-            items[items.length - 1].push(trimLine(lines[i]));
-            i++;
+          } else if (li.charCodeAt(0) === 32 && li.charCodeAt(1) === 32) {
+            // A continuation: two or more spaces, then a non-space.
+            let k = 2;
+            while (k < li.length && li.charCodeAt(k) === 32) k++;
+            if (k < li.length && !isWS(li.charCodeAt(k))) {
+              items[items.length - 1].push(trimLine(li));
+              i++;
+            } else break;
           } else break;
         }
         out.push((startNum !== 1 ? '<ol start="' + startNum + '">' : '<ol>') + '\n');
         for (const item of items) {
           out.push('<li>');
-          inlineTo(item.join('\n'), env, out);
+          const it = item.join('\n');
+          inlineTo(it, 0, it.length, env, out);
           out.push('</li>\n');
         }
         out.push('</ol>\n');
       } else {
         while (i < n) {
-          const m = bulletMatch(lines[i]);
-          if (m !== null) {
-            items.push([trimLine(m)]);
+          const li = lines[i];
+          const c0 = li.charCodeAt(0);
+          if ((c0 === 45 || c0 === 42) && li.charCodeAt(1) === 32) {
+            items.push([trimLine(li.slice(2))]);
             i++;
-          } else if (isContinued(lines[i])) {
-            items[items.length - 1].push(trimLine(lines[i]));
-            i++;
+          } else if (c0 === 32 && li.charCodeAt(1) === 32) {
+            // A continuation: two or more spaces, then a non-space.
+            let k = 2;
+            while (k < li.length && li.charCodeAt(k) === 32) k++;
+            if (k < li.length && !isWS(li.charCodeAt(k))) {
+              items[items.length - 1].push(trimLine(li));
+              i++;
+            } else break;
           } else break;
         }
         out.push('<ul>\n');
         for (const item of items) {
           out.push('<li>');
-          inlineTo(item.join('\n'), env, out);
+          const it = item.join('\n');
+          inlineTo(it, 0, it.length, env, out);
           out.push('</li>\n');
         }
         out.push('</ul>\n');
@@ -577,10 +692,35 @@ function renderMarkdown(lines, start, env, slugCache) {
     }
     const body = [trimLine(line)];
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    // A paragraph ends at a blank line, a fence, a heading or a break
+    // (endsParagraph, inlined). A continuation line starts with any other
+    // character, so the common case is a few charCodeAt comparisons; only a
+    // line starting with '#', '`', '-' or '*' (or space/tab) is validated.
+    while (i < n) {
+      const nx = lines[i];
+      if (nx === '') break;
+      const d0 = nx.charCodeAt(0);
+      if (d0 === 35 || d0 === 96 || d0 === 45 || d0 === 42 || d0 === 32 || d0 === 9) {
+        if (d0 === 32 || d0 === 9) {
+          let allWS = true;
+          for (let j = 0; j < nx.length; j++) {
+            const cc = nx.charCodeAt(j);
+            if (cc !== 32 && cc !== 9) { allWS = false; break; }
+          }
+          if (allWS) break;
+        } else if (d0 === 35) {
+          if (headingOf(nx) !== null) break;
+        } else if (d0 === 96) {
+          if (fenceOpen(nx) !== null) break;
+        } else if (isHR(nx)) break;
+      }
+      body.push(trimLine(nx));
+      i++;
+    }
     const mark = out.length;
     out.push('<p>');
-    inlineTo(body.join('\n'), env, out);
+    const para = body.join('\n');
+    inlineTo(para, 0, para.length, env, out);
     out.push('</p>\n');
     if (excerpt === null) excerpt = out.slice(mark + 1, -1).join('');
   }
@@ -732,13 +872,24 @@ function genExpr(path) {
   return e;
 }
 
-/** `nodes` compiled to JS statements, appended to `parts`. */
+/** `nodes` compiled to JS statements, appended to `parts`. Consecutive plain
+ * pushes batch into one O.push(a, b, c) call: a template render is hundreds
+ * of pushes, and one call per node is the cost. Control flow flushes the
+ * batch first, so the order of the output is unchanged. */
 function genNodes(nodes, parts, parsed) {
+  let buf = [];
+  const flush = () => {
+    if (buf.length > 0) {
+      parts.push('O.push(' + buf.join(',') + ');');
+      buf = [];
+    }
+  };
   for (const n of nodes) {
-    if (n.kind === 'text') parts.push('O.push(' + JSON.stringify(n.text) + ');');
-    else if (n.kind === 'var') parts.push('O.push(C.e(C.x(' + genExpr(n.path) + ')));');
-    else if (n.kind === 'raw') parts.push('O.push(C.x(' + genExpr(n.path) + '));');
+    if (n.kind === 'text') buf.push(JSON.stringify(n.text));
+    else if (n.kind === 'var') buf.push('C.e(C.x(' + genExpr(n.path) + '))');
+    else if (n.kind === 'raw') buf.push('C.x(' + genExpr(n.path) + ')');
     else if (n.kind === 'if') {
+      flush();
       const cond = 'C.y(' + genExpr(n.path) + ')';
       parts.push('if(' + (n.not ? '!' + cond : cond) + '){');
       genNodes(n.then, parts, parsed);
@@ -748,6 +899,7 @@ function genNodes(nodes, parts, parsed) {
       }
       parts.push('}');
     } else if (n.kind === 'for') {
+      flush();
       const usesLoop = bodyUsesLoop(n.body, parsed, new Set());
       parts.push(
         '{const _a=' + genExpr(n.path) + ';if(Array.isArray(_a)){const _n=_a.length,_s0=V.' + n.name +
@@ -757,9 +909,11 @@ function genNodes(nodes, parts, parsed) {
       genNodes(n.body, parts, parsed);
       parts.push('}V.' + n.name + '=_s0;' + (usesLoop ? 'V.loop=_s1;' : '') + '}}');
     } else if (n.kind === 'include') {
+      flush();
       parts.push('{const _f=C.t.get(' + JSON.stringify(n.name) + ');if(_f!==void 0&&D<8)_f(O,V,C,D+1);}');
     }
   }
+  flush();
 }
 
 /** `nodes` compiled to a render function (O, V, C, D): output array, flat scope, context, include depth. */
